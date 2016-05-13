@@ -116,7 +116,9 @@
 #endif
 
 #ifdef USE_SAMSUNG_COLORFORMAT
+#ifndef SPRD_HARDWARE
 #include <sec_format.h>
+#endif
 #endif
 
 #ifdef USE_S3D_SUPPORT
@@ -416,6 +418,11 @@ uint32_t OMXCodec::getComponentQuirks(
     if (info->hasQuirk("requires-global-flush")) {
         quirks |= kRequiresGlobalFlush;
     }
+#ifdef SPRD_HARDWARE
+    if (info->hasQuirk("needs-flush-before-disable")) {
+        quirks |= kNeedsFlushBeforeDisable;
+    }
+#endif
 
 #ifdef ENABLE_AV_ENHANCEMENTS
     quirks |= ExtendedCodec::getComponentQuirks(info);
@@ -429,6 +436,27 @@ uint32_t OMXCodec::getComponentQuirks(
         quirks |= kRequiresFlushCompleteEmulation;
     }
 #endif // DOLBY_END
+
+#ifdef USE_ALP_AUDIO
+    /*
+     * Exynos Mp3 decoder needs the following quirks.
+     *
+     * kSupportsMultipleFramesPerInputBuffer :
+     *         To coalesce as much as SRP's input buffer size
+     * kNeedsFlushBeforeDisable :
+     *         Flush is necessary before port is disabled.
+     */
+    if (!strcmp("OMX.Exynos.MP3.Decoder", info->getCodecName())) {
+        quirks |= kSupportsMultipleFramesPerInputBuffer;
+        quirks |= kNeedsFlushBeforeDisable;
+    }
+#endif
+#ifdef USE_SEIREN_AUDIO
+    if (!strcmp("OMX.Exynos.AAC.Decoder", info->getCodecName())) {
+        quirks |= kSupportsMultipleFramesPerInputBuffer;
+        quirks |= kNeedsFlushBeforeDisable;
+    }
+#endif
 
     return quirks;
 }
@@ -2073,6 +2101,9 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
             def.nBufferCountActual, def.nBufferSize,
             portIndex == kPortIndexInput ? "input" : "output");
 
+    if (def.nBufferSize != 0 && def.nBufferCountActual > SIZE_MAX / def.nBufferSize) {
+        return BAD_VALUE;
+    }
 #ifdef MTK_HARDWARE
     OMX_U32 memoryAlign = 32;
     size_t totalSize = def.nBufferCountActual *
@@ -2485,9 +2516,11 @@ void OMXCodec::setNativeWindowColorFormat(OMX_COLOR_FORMATTYPE &eNativeColorForm
     // Convert OpenMAX color format to native color format
     switch (eNativeColorFormat) {
         // In case of SAMSUNG color format
+#ifndef SPRD_HARDWARE
         case OMX_SEC_COLOR_FormatNV12TPhysicalAddress:
             eNativeColorFormat = (OMX_COLOR_FORMATTYPE)HAL_PIXEL_FORMAT_CUSTOM_YCbCr_420_SP_TILED;
             break;
+#endif
         case OMX_SEC_COLOR_FormatNV12Tiled:
             eNativeColorFormat = (OMX_COLOR_FORMATTYPE)HAL_PIXEL_FORMAT_YCbCr_420_SP_TILED;
             break;
@@ -3592,10 +3625,18 @@ void OMXCodec::fillOutputBuffers() {
                 == mPortBuffers[kPortIndexInput].size()
             && countBuffersWeOwn(mPortBuffers[kPortIndexOutput])
                 == mPortBuffers[kPortIndexOutput].size()) {
+#ifdef USE_ALP_AUDIO
+        /* Exynos mp3 decoder should be finished by EOS flag in output buffer. */
+        /* Do not apply this workaround */
+        if (strcmp(mComponentName, "OMX.Exynos.MP3.Decoder") != 0) {
+#endif
         mNoMoreOutputData = true;
         mBufferFilled.signal();
 
         return;
+#ifdef USE_ALP_AUDIO
+        }
+#endif
     }
 
     Vector<BufferInfo> *buffers = &mPortBuffers[kPortIndexOutput];
@@ -3915,12 +3956,30 @@ bool OMXCodec::drainInputBuffer(BufferInfo *info) {
             break;
         }
 
+#ifdef USE_ALP_AUDIO
+#ifndef USE_SEIREN_AUDIO
+        /*
+         * In ALP mode, 250ms restriction is not required.
+         * SRP driver must have enough frames for the size of its input buffer.
+         */
+        if (strcmp(mComponentName, "OMX.Exynos.MP3.Decoder") != 0) {
+#endif
+#endif
         int64_t coalescedDurationUs = lastBufferTimeUs - timestampUs;
 
+#ifdef USE_SEIREN_AUDIO
+        if (coalescedDurationUs > 150000ll) {
+#else
         if (coalescedDurationUs > 250000ll) {
+#endif
             // Don't coalesce more than 250ms worth of encoded data at once.
             break;
         }
+#ifdef USE_ALP_AUDIO
+#ifndef USE_SEIREN_AUDIO
+        }
+#endif
+#endif
     }
 
     if (n > 1) {
